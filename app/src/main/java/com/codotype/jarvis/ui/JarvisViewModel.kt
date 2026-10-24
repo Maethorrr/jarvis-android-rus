@@ -57,7 +57,14 @@ class JarvisViewModel(private val app: Application) : ViewModel() {
     private val recorder = AudioRecorder()
     private val store = ConversationStore(File(app.filesDir, "conversation.json"))
 
-    private val _ui = MutableStateFlow(UiState())
+ private val _ui = MutableStateFlow(
+    UiState(
+        nativeAvailable = run {
+            NativeLoader.load()
+            NativeLoader.llmAvailable && NativeLoader.sttAvailable
+        }
+    )
+)
     val ui: StateFlow<UiState> = _ui.asStateFlow()
 
     val amplitude: StateFlow<Float> = recorder.amplitude
@@ -191,10 +198,24 @@ class JarvisViewModel(private val app: Application) : ViewModel() {
 
     // ---- Voice -------------------------------------------------------------
 
-    fun startListening() {
-        recorder.start()
-        _ui.update { it.copy(isListening = true) }
+fun startListening() {
+    val started = recorder.start()
+
+    _ui.update {
+        it.copy(
+            isListening = started,
+            error = if (started) null else "Не удалось запустить микрофон"
+        )
     }
+
+    if (!started) {
+        android.widget.Toast.makeText(
+            app,
+            "Не удалось запустить микрофон",
+            android.widget.Toast.LENGTH_LONG
+        ).show()
+    }
+}
 
     fun stopListeningAndTranscribe() {
         val samples = recorder.stop()
