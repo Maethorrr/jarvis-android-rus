@@ -4,87 +4,209 @@ import android.annotation.SuppressLint
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import java.io.ByteArrayOutputStream
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlin.math.abs
 import kotlin.math.sqrt
 
-/**
- * Records mono 16-bit PCM at 16 kHz — exactly the format whisper.cpp expects —
- * and exposes a normalised amplitude for the waveform UI.
- */
 class AudioRecorder {
 
     private val sampleRate = 16_000
-    private var record: AudioRecord? = null
+
+    @Volatile
     private var recording = false
+
+    private var record: AudioRecord? = null
+    private var readerThread: Thread? = null
+
+    private val audioLock = Any()
+    private val pcmBytes = ByteArrayOutputStream()
 
     private val _amplitude = MutableStateFlow(0f)
     val amplitude: StateFlow<Float> = _amplitude.asStateFlow()
 
     @SuppressLint("MissingPermission")
-    fun start() {
-        if (recording) return
+    @Synchronized
+    fun start(): Boolean {
+        if (recording) return true
+
         val minBuf = AudioRecord.getMinBufferSize(
             sampleRate,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT
-        ).coerceAtLeast(sampleRate) // >= 1 second of headroom
+        ).coerceAtLeast(sampleRate)
+
         val bufferSize = maxOf(minBuf, sampleRate * 2)
 
-        val rec = AudioRecord(
-            MediaRecorder.AudioSource.VOICE_RECOGNITION,
-            sampleRate,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-            bufferSize
-        )
+        val rec = runCatching {
+            AudioRecord(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufferSize
+            )
+        }.getOrNull() ?: return false
+
         if (rec.state != AudioRecord.STATE_INITIALIZED) {
             rec.release()
-            return
+            return false
         }
-        record = rec
-        recording = true
-        rec.startRecording()
-    }
 
-    /** Stops recording and returns the captured audio as float PCM in [-1, 1]. */
-    fun stop(): FloatArray {
-        val rec = record ?: return FloatArray(0)
-        recording = false
-        runCatching { rec.stop() }
-
-        val out = ArrayList<Short>(sampleRate * 4)
-        val buf = ShortArray(2048)
-        while (true) {
-            val n = rec.read(buf, 0, buf.size)
-            if (n <= 0) break
-            for (i in 0 until n) out.add(buf[i])
+        synchronized(audioLock) {
+            pcmBytes.reset()
         }
-        rec.release()
-        record = null
         _amplitude.value = 0f
 
-        val samples = FloatArray(out.size)
-        for (i in out.indices) samples[i] = out[i] / 32768f
-        return samples
+        val started = runCatching {
+            rec.startRecording()
+            rec.recordingState == AudioRecord.RECORDSTATE_RECORDING
+        }.getOrDefault(false)
+
+        if (!started) {
+            runCatching { rec.release() }
+            return false
+        }
+
+        record = rec
+        recording = true
+
+        readerThread = Thread({
+            val buffer = ShortArray(2048)
+
+            while (recording) {
+                val count = try {
+                    rec.read(
+                        buffer,
+                        0,
+                        buffer.size,
+                        AudioRecord.READ_BLOCKING
+                    )
+                } catch (_: Exception) {
+                    break
+                }
+
+                if (count <= 0) break
+
+                val bytes = ByteArray(count * 2)
+
+                for (i in 0 until count) {
+                    val value = buffer[i].toInt()
+                    bytes[i * 2] = (value and 0xff).toByte()
+                    bytes[i * 2 + 1] = (value shr 8).toByte()
+                }
+
+                synchronized(audioLock) {
+                    pcmBytes.write(bytes, 0, bytes.size)
+                }
+
+                updateAmplitude(buffer, count)
+            }
+        }, "JarvisAudioReader").apply {
+            isDaemon = true
+            start()
+        }
+
+        return true
     }
 
-    /** Call from a polling loop while recording to update [amplitude]. */
-    fun updateAmplitude(samples: ShortArray) {
-        if (samples.isEmpty()) return
+    fun stop(): FloatArray {
+        val rec: AudioRecord
+        val thread: Thread?
+
+        synchronized(this) {
+            rec = record ?: run {
+                recording = false
+                _amplitude.value = 0f
+                return FloatArray(0)
+            }
+
+            recording = false
+            runCatching {
+                if (rec.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                    rec.stop()
+                }
+            }
+
+            thread = readerThread
+        }
+
+        if (thread != null && thread !== Thread.currentThread()) {
+            runCatching { thread.join(1000) }
+        }
+
+        runCatching { rec.release() }
+
+        if (thread != null && thread !== Thread.currentThread()) {
+            runCatching { thread.join(200) }
+        }
+
+        synchronized(this) {
+            if (record === rec) record = null
+            readerThread = null
+        }
+
+        val bytes = synchronized(audioLock) {
+            pcmBytes.toByteArray().also { pcmBytes.reset() }
+        }
+
+        _amplitude.value = 0f
+
+        val count = bytes.size / 2
+        return FloatArray(count) { i ->
+            val sample = (
+                (bytes[i * 2 + 1].toInt() shl 8) or
+                    (bytes[i * 2].toInt() and 0xff)
+                ).toShort()
+
+            sample.toInt() / 32768f
+        }
+    }
+
+    private fun updateAmplitude(samples: ShortArray, count: Int) {
+        if (count <= 0) return
+
         var sum = 0.0
-        for (s in samples) sum += (s / 32768.0) * (s / 32768.0)
-        val rms = sqrt(sum / samples.size)
-        _amplitude.value = abs(rms).toFloat().coerceIn(0f, 1f)
+
+        for (i in 0 until count) {
+            val value = samples[i].toDouble() / 32768.0
+            sum += value * value
+        }
+
+        _amplitude.value = sqrt(sum / count)
+            .toFloat()
+            .coerceIn(0f, 1f)
     }
 
+    @Synchronized
     fun cancel() {
         recording = false
-        runCatching { record?.stop() }
-        runCatching { record?.release() }
+
+        val rec = record
+        val thread = readerThread
+
+        if (rec != null) {
+            runCatching {
+                if (rec.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                    rec.stop()
+                }
+            }
+        }
+
+        if (thread != null && thread !== Thread.currentThread()) {
+            runCatching { thread.join(1000) }
+        }
+
+        runCatching { rec?.release() }
+
         record = null
+        readerThread = null
+
+        synchronized(audioLock) {
+            pcmBytes.reset()
+        }
+
         _amplitude.value = 0f
     }
 }
