@@ -22,7 +22,7 @@ class WhisperEngine {
         handle = 0L
     }
 
-    suspend fun transcribe(samples: FloatArray, language: String = "en"): String =
+    suspend fun transcribe(samples: FloatArray, language: String = "auto"): String =
         withContext(Dispatchers.Default) {
             val h = handle
             if (h == 0L || samples.isEmpty()) return@withContext ""
