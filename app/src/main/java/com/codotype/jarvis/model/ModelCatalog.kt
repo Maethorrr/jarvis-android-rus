@@ -87,7 +87,7 @@ object ModelCatalog {
     )
 
     val defaultLlm: ModelSpec = qwen05b
-    val defaultStt: ModelSpec = whisperTinyEn
+    val defaultStt: ModelSpec = whisperTinyMulti
 
     fun byId(id: String): ModelSpec? = all.firstOrNull { it.id == id }
 }
